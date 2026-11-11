@@ -28,9 +28,9 @@ A [GitHub Actions workflow](https://docs.github.com/en/actions/learn-github-acti
 
 You just need to do two things to set up your repository to support previews, both in the repository settings:
 
-### 1. Deploy Pages from branch
+### 1. Choose how GitHub Pages is deployed
 
-Ensure that your repository is configured to have its GitHub Pages site deployed from a branch, by setting the source for the deployment under **Settings** > **Pages** of your repository to **Deploy from branch**:
+The default `branch` deployment method requires the site to be deployed from a branch. Set the source under **Settings** > **Pages** to **Deploy from branch**:
 
 <p align="center">
   <img src="https://github.com/rossjrw/pr-preview-action/blob/main/.github/deployment-settings.png" alt="GitHub Pages settings">
@@ -39,12 +39,11 @@ Ensure that your repository is configured to have its GitHub Pages site deployed
   Pictured: Repository Pages settings at /settings/page
 </p>
 
-> [!IMPORTANT]  
-> The other option (called "GitHub Actions") has a [misleading name](https://github.com/orgs/community/discussions/30113#discussioncomment-7650234) and does not work with this action.
+To use the **GitHub Actions** source, set `deployment-method: pages-artifact` and follow [GitHub Pages artifact deployment](#github-pages-artifact-deployment) below.
 
 ### 2. Let your workflow write to the repo
 
-In **Settings** > **Actions** > **General** > **Workflow permissions**, select "Read and write permissions" to allow action runs to make changes to your deployment branch (in this case, to add and remove previews).
+For the default branch method, select **Read and write permissions** in **Settings** > **Actions** > **General** so runs can update the deployment branch. The artifact method has additional permissions and environment setup documented below.
 
 # Usage
 
@@ -90,24 +89,92 @@ jobs:
 > [!TIP]  
 > The `gh-pages` branch is used for GitHub Pages deployments by convention, and will be used in examples here as well, but you can use whatever branch you like (just make sure to change the `preview-branch` input).
 
+## GitHub Pages artifact deployment
+
+Set the Pages publishing source to **GitHub Actions**. This mode keeps the currently published site and active PR previews on a dedicated state branch, then uploads that complete directory with `actions/upload-pages-artifact` and publishes it with `actions/deploy-pages`.
+
+The state branch is storage for the published files; it is not the Pages source. The first run on the default branch initializes it. PR updates, PR cleanup, and later production builds all update this state and deploy the resulting full site.
+
+The workflow needs write access to the state branch and Pages, plus an OIDC token. The `github-pages` environment must allow the PR branches that will deploy. Keep production pushes and PR preview runs in the same concurrency group so they do not publish stale snapshots.
+
+```yml
+# .github/workflows/pages.yml
+name: Deploy Pages and PR previews
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+        types:
+            - opened
+            - reopened
+            - synchronize
+            - closed
+
+permissions:
+    contents: write
+    pages: write
+    id-token: write
+    pull-requests: write
+
+concurrency:
+    group: github-pages
+    cancel-in-progress: false
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+        environment:
+            name: github-pages
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Install and build
+              if: github.event.action != 'closed'
+              run: |
+                  npm install
+                  npm run build
+
+            - name: Deploy Pages and PR preview
+              uses: c19yamamoto/pr-preview-action@codex/pages-artifact-deployment
+              with:
+                  deployment-method: pages-artifact
+                  source-dir: ./build/
+                  pages-artifact-state-branch: pr-preview-pages-artifact-state
+                  qr-code: false
+```
+
+On PR events, `source-dir` is that PR's build output. On a push to the default branch, it is the full production site; the action syncs those files while preserving previews. When a PR closes, the build is skipped and its preview is removed.
+
+Configure the `github-pages` environment to allow PR branches to deploy. A rule that allows only the default branch will reject PR preview deployments. This mode is intended for trusted branches in the same repository; fork PRs do not receive the write permissions needed to update the state branch.
+
+Use the current repository as `deploy-repository`; GitHub Pages artifacts deploy to the repository running the workflow. Leave `pages-base-path` empty because the uploaded artifact directory is the site root. Set `include-hidden-files: true` only if the published site needs dotfiles such as `.nojekyll`. Hidden files are excluded by default to avoid publishing files that are not meant to be public. GitHub Pages artifact deployment uses GitHub's Actions artifact service; this mode targets GitHub.com.
+
+All workflows that publish this site must share the same concurrency group. If your main site has a separate deployment workflow, give it the same group as the PR workflow. GitHub keeps at most one pending run per group, so rerun any deployment run that gets superseded while waiting.
+
 ## Inputs (configuration)
 
 The following input parameters are provided, which can be passed to the `with` parameter. ALL parameters are optional and have a default value.
 
 | Input&nbsp;parameter | Description |
 | --- | --- |
-| `source-dir` | When creating or updating a preview, the path to the directory that contains the files to deploy. E.g. if your project builds to `./dist/` you would put `./dist/` (or `dist`, etc.). <br> Equivalent to [JamesIves/github-pages-deploy-action](https://github.com/JamesIves/github-pages-deploy-action) 'folder' setting. <br><br> Default: `.` (repository root) |
+| `source-dir` | Directory containing files to deploy. In `branch` mode it is the PR preview output. In `pages-artifact` mode it is the PR build for PR events and the full production site on a default-branch push. <br><br> Default: `.` (repository root) |
+| `deployment-method` | Deployment backend: `branch` (default) updates a Pages branch; `pages-artifact` maintains a complete site tree on `pages-artifact-state-branch` and publishes it with `actions/upload-pages-artifact` and `actions/deploy-pages`. |
+| `pages-artifact-state-branch` | Branch used as durable storage for the full artifact-mode site and active previews. It is not the GitHub Pages publishing source. <br><br> Default: `pr-preview-pages-artifact-state` |
+| `include-hidden-files` | Include dotfiles in the uploaded Pages artifact. <br><br> Default: `false` |
 | `deploy-repository` | The repository to deploy the preview to. <br> **Note:** The `token` parameter must also be set if changing this from the default. <br><br> Default: The pull request's target repository. |
-| `preview-branch` | Branch to save previews to. This should be the same branch that your GitHub Pages site is deployed from. <br><br> Default: `gh-pages` |
+| `preview-branch` | Branch to save previews to when `deployment-method: branch`. This should be the same branch that your GitHub Pages site is deployed from. <br><br> Default: `gh-pages` |
 | `umbrella-dir` | Path to the directory to place previews in. <br> The umbrella directory is used to namespace previews from your main branch's deployment on GitHub Pages. <br><br> Default: `pr-preview` |
 | `pr-number` | The PR number to use for the preview path. <br> Useful for testing or when the workflow is not triggered by a pull_request event. <br><br> Default: The PR number (`${{ github.event.number }}`) |
 | `pages-base-url` | Base URL to use when providing a link to the preview site. <br><br> Default: The pull request's target repository's default GitHub Pages URL (e.g. `rossjrw.github.io/pr-preview-action/`) |
 | `pages-base-path` | Path that GitHub Pages is being served from, as configured in your repository settings, e.g. `docs/`. When generating the preview URL path, this is removed from the beginning of the file path. <br><br> Default: `.` (repository root) |
-| `wait-for-pages-deployment` <br> (boolean) | Whether to wait for the GitHub Pages deployment to complete. When enabled, the action will poll the GitHub Deployments API and delay workflow completion until the Pages deployment finishes, e.g. to ensure the preview URL is accessible when the comment is posted. <br><br> Default: `false` (this will be `true` in a future version of this Action) |
+| `wait-for-pages-deployment` <br> (boolean) | In `branch` mode, whether to poll the GitHub Deployments API and wait for Pages before continuing. `pages-artifact` mode always waits for `actions/deploy-pages` to finish. <br><br> Default: `false` |
 | `comment` <br> (boolean) | Whether to leave a [sticky comment](https://github.com/marocchino/sticky-pull-request-comment) on the PR after the preview is built.<br> The comment may be added before the preview finishes deploying unless `wait-for-pages-deployment` is enabled. <br><br> Default: `true` |
 | `qr-code` <br> | Whether to include a QR code in the sticky comment for easy mobile access, which links to the preview URL. Only affects the default comment (i.e. if `comment` is not `false`). <br> Enabled by default - set to `false` to disable, or to a string to use a different provider ([see below](#use-a-different-qr-code-provider)). <br><br> Default: [`https://qr.rossjrw.com/?color.dark=0d1117&url=`](https://qr.rossjrw.com) |
 | `token` | Authentication token for the preview deployment. <br> The default value works for non-fork pull requests to the same repository. For anything else, you will need a [Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token) with permission to access it, and [store it as a secret](https://docs.github.com/en/actions/security-guides/using-secrets-in-github-actions) in your repository. E.g. you might name that secret 'PREVIEW_TOKEN' and use it with `token: ${{ secrets.PREVIEW_TOKEN }}`. <br><br> Default: `${{ github.token }}`, which gives the action permission to deploy to the current repository. |
-| `action` <br> (enum) | Determines what this action will do when it is executed. Supported values: <br><br> <ul><li>`deploy` - create and deploy the preview, overwriting any existing preview in that location.</li><li>`remove` - remove the preview.</li><li>`auto` - determine whether to deploy or remove the preview based on [the emitted event](https://docs.github.com/en/developers/webhooks-and-events/webhooks/webhook-events-and-payloads#pull_request). If the event is `pull_request`, it will deploy the preview when the event type is `opened`, `reopened` and `synchronize`, and remove it on `closed` events. Does not do anything for other events or event types, even if you explicitly instruct the workflow to run on them.</li><li>`none` and all other values: does not do anything.</li></ul> Default: `auto` |
+| `action` <br> (enum) | Supported values: `deploy`, `remove`, `sync`, `auto`. `sync` is available only in `pages-artifact` mode and updates production files while preserving previews. `auto` deploys/removes on pull request events and syncs on pushes to the default branch in `pages-artifact` mode. |
 
 <details>
 <summary><b>Extra parameters for controlling the commits</b></summary>
@@ -140,11 +207,12 @@ You could use these outputs and input parameter `comment: false` to write your o
 
 | Output | Description |
 | --- | --- |
-| `deployment-action` | Resolved value of the `action` input parameter (deploy, remove, none). |
+| `deployment-action` | Resolved value of the `action` input parameter (deploy, remove, sync, none). |
 | `pages-base-url` | What this Action thinks the base URL of the GitHub Pages site is. |
 | `preview-url-path` | Path to the preview from the Pages base URL. |
 | `preview-url` | Full URL to the preview (`https://<pages-base-url>/<preview-url-path>/`). |
-| `deployed-commit-sha` | The SHA of the commit that was deployed to the preview branch. |
+| `deployed-commit-sha` | The SHA persisted to the preview branch or Pages artifact state branch. |
+| `pages-deployment-url` | URL returned by `actions/deploy-pages` in `pages-artifact` mode. |
 | `action-version` | The full, exact version of this Action when it was run. |
 | `action-start-timestamp` | The time that the workflow step started as a Unix timestamp. |
 | `action-start-time` | The time that the workflow step started in a readable format (UTC, depending on runner). |
